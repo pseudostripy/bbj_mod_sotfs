@@ -1,18 +1,25 @@
 /*
  *    build cmd with mingw64:
- * 		gcc -m64 -Wall nobbjsotfs.c -shared -o DINPUT8.dll
+ * 		gcc -m64 -Wall nobbjsotfs.c -shared -o DINPUT8.dll -l Psapi
  */
+
+/*
+		 This DLL implements the bbj mod originally named in CE:
+			"Baby Jump fix (only one can be active at a time)"
+*/
 
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <psapi.h>
+#include <processthreadsapi.h>
+
+//#define NOLOGO
 
 /*
- *    This patching mechanism taken from:
+ *    This patching mechanism is taken from:
  *        https://github.com/bladecoding/DarkSouls3RemoveIntroScreens/blob/master/SoulsSkipIntroScreen/dllmain.cpp
- *
- *
  */
 struct patch {
     DWORD rel_addr;
@@ -43,122 +50,54 @@ void setup_d8proxy(void)
 
 void attach_hook(void)
 { 	
+	void *module_addr = GetModuleHandle(NULL);
+	MODULEINFO moduleInfo;
+	GetModuleInformation(GetCurrentProcess(), GetModuleHandle(NULL), &moduleInfo, sizeof(moduleInfo));
+	
+	//// TESTING (GetModuleSize --> DS2 Version)
+	//FILE* out_file = fopen("moduleinfo.txt", "w");						// write only 
+	//fprintf(out_file, "Module size: %ld\n", moduleInfo.SizeOfImage);		// write to file 
+	//fclose(out_file);
+	
+	// Declare address variables:
+	DWORD basea_offset;
+	DWORD nologo_offset;
+	DWORD jumpfcn_offset;
 
-	/* 	This whole function is untidy and the variable names are terrible, sorry!
-		One day I'll improve as a person and sort this out.
-	
-		Here the inject/patch uses the scratch r10 register for dumping variables
-	*/
-    void *base_addr = GetModuleHandle(NULL);
-
-    *(byte*)(base_addr + 0x1604DFA) = 0x01; // nologo patch
-	
-	/*
-		Add the Baby Jump fix code
-		Note: this is described in the bbj mod CE version as:
-			"Baby Jump fix (only one can be active at a time)"
-	*/
-	
-	static char spd_bytes[] =
-	{
-		//update jmp from dll (64bit)
-		0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 	// [0] mov r10, tempaddr_xxxxxxxx
-		0x49, 0x8b, 0x02, 												// mov rax, [r10] 
-		
-		// CE newmem:
-		0x48, 0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		// [13] mov qword ptr [BasePtr (xxxxxxxx)], rax
-		
-		//orig:
-		0x48, 0x8B, 0x58, 0x38, 										// [23] mov rbx, [rax+38]   
-		
-		//return to orig (64bit jmp)
-		0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 	// [27] mov r10, addr_xxxxxxxx
-		0x41, 0xFF, 0xE2, 												// [37] jmp r10 
-		
-		// speedBse:xxxxxxxx
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	};			
-
-	void *spdhook = spd_bytes;
-	void *BasePtr = &spd_bytes[40]; // (aka speedBse in Vanilla)
-	
-	struct patch spd_patch = 
-	    {
-			0x3EE3F9, 												// "Base"  
-			14,
-			// inject:
-			{0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 	// mov r10, addr_xxxxxxxx
-			 0x41, 0xFF, 0xE2,												// [10] jmp r10
-			 0x90 															// [13] nop filler
-			},
-			 
-			// orig:
-			{0x48, 0x8B, 0x05, 0xD0, 0xD4, 0x21, 0x01,  // mov rax,[DarkSoulsII.exe+160B8D0]
-			 0x48, 0x8B, 0x58, 0x38,    				// mov rbx,[rax+38]
-			 0x48, 0x85, 0xDB 							// [11] test rbx,rbx
-			}, 			
-	    };
-		
-	void *spdinjaddr = base_addr + spd_patch.rel_addr;
-	void *spdinj_ret = spdinjaddr + spd_patch.size;
-	
-	DWORD temprel = 0x160B8D0;
-	void *tmpaddr = base_addr + temprel;
-	
-	uint64_t addrToJumpTo64 = (uint64_t) spdhook;
-    memcpy(&spd_patch.patch[2], &addrToJumpTo64, sizeof(addrToJumpTo64)); 		// jmp fw
-	memcpy(&spd_bytes[29],&spdinj_ret,sizeof(spdinj_ret)); 						// return to spdinject (+offset)
-	memcpy(&spd_bytes[2],&tmpaddr,sizeof(tmpaddr)); 							// fix mov rax,[DarkSoulsII.exe+160B8D0] 
-	memcpy(&spd_bytes[15],&BasePtr,sizeof(BasePtr)); 							// fix mov [BasePtr],rax 
-	
-	DWORD op;
-	VirtualProtect(spd_bytes, sizeof(spd_bytes),
-		       PAGE_EXECUTE_READWRITE, &op);
-	
-	// Edit memory:
-	DWORD size = spd_patch.size;
-	if (memcmp(spdinjaddr, spd_patch.orig, size) == 0) {
-		DWORD old;
-		VirtualProtect(spdinjaddr, size, PAGE_EXECUTE_READWRITE, &old);
-		memcpy(spdinjaddr, spd_patch.patch, size);
-		VirtualProtect(spdinjaddr, size, old, &old);
+	// Switch version / Populate addresses:
+	if (moduleInfo.SizeOfImage == 34299904) {
+		// Unpatched game:
+		basea_offset = 0x160B8D0;
+		nologo_offset = 0x1604DFA;
+		jumpfcn_offset = 0x37B4BC;
 	}
+	else if (moduleInfo.SizeOfImage == 30892032) {
+		// Online patch:
+		basea_offset = 0x16148F0;
+		nologo_offset = 0x160DE1A;
+		jumpfcn_offset = 0x0381E1C;
+	}
+	else {
+		return; // unimplemented version
+	}
+
+	//////////////////////////////////////////
+	//				NOLOGO Mod:
+#ifdef NOLOGO
+	*(byte*)(module_addr + nologo_offset) = 0x01;
+#endif
+	//////////////////////////////////////////
 	
-	
-	/*	
-		Add the "NoBabyJ (full jump length)" code
-	*/
-	static char jump_bytes[] =
-	{
-		// orig:
-		0xF3, 0x0F, 0x58, 0xC8, 									// addss  xmm1,xmm0
-		0x0F, 0xC6, 0xC9, 0x00,            							// shufps xmm1,xmm1,00
-		0x0F, 0x51, 0xC1,     										// sqrtps xmm0,xmm1
-		
-		// newmem:
-		0x50, 														// [11] push rax
-		0x48, 0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [12] mov rax,[BasePtr (xxxxxxxx)]
-		0x48, 0x8B, 0x80, 0xD0, 0x00, 0x00, 0x00, 					// [22] mov rax,[rax+D0]
-		0x48, 0x8B, 0x80, 0xF8, 0x00, 0x00, 0x00, 					// [29] mov rax,[rax+F8]
-		0x48, 0x8B, 0x80, 0xF0, 0x00, 0x00, 0x00, 					// [36] mov rax,[rax+F0]
-		0xF3, 0x0F, 0x10, 0x80, 0x98, 0x37, 0x00, 0x00, 			// [43] movss xmm0,[rax+3798]
-		0x58, 														// [51] pop rax
-		
-		// orig:
-		0x0F, 0x29, 0x44, 0x24, 0x20, 								// [52] movaps [rsp+20], xmm0
-		
-		//return to orig (64bit jmp)
-		0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [57] mov r10, addr_xxxxxxxx
-		0x41, 0xFF, 0xE2, 											// jmp r10 
-	};
-	
-	void *jumphook = jump_bytes;
+
+	// Setup the (version-specific) basepointer:
+	void * baseA = module_addr + basea_offset;
 	
 	struct patch jump_patch = 
 	    {
-			0x37B4BC, 												// "INJECT"  
-			16,
-			// inject:
+			jumpfcn_offset, 										// rel_addr  
+			16,														// size (bytes)
+
+			// patch (inject):
 			{0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 	// mov r10, addr_xxxxxxxx
 			 0x41, 0xFF, 0xE2,												// [10] jmp r10
 			 0x90, 0x90, 0x90 												// [13] nop filler
@@ -172,16 +111,51 @@ void attach_hook(void)
 			},       	
 	    };
 	
-	void *jumpinjaddr = base_addr + jump_patch.rel_addr;
-	void *jumpinj_ret = jumpinjaddr + jump_patch.size;
+	// "NoBabyJ (full jump length)" code
+	static char bbjcode_bytes[] =
+	{
+		// orig:
+		0xF3, 0x0F, 0x58, 0xC8, 									// addss  xmm1,xmm0
+		0x0F, 0xC6, 0xC9, 0x00,            							// shufps xmm1,xmm1,00
+		0x0F, 0x51, 0xC1,     										// sqrtps xmm0,xmm1
+
+		// newmem:
+		0x50, 														// [11] push rax
+		0x48, 0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [12] mov rax,[baseA]
+		0x48, 0x8B, 0x80, 0xD0, 0x00, 0x00, 0x00, 					// [22] mov rax,[rax+D0]
+		0x48, 0x8B, 0x80, 0xF8, 0x00, 0x00, 0x00, 					// [29] mov rax,[rax+F8]
+		0x48, 0x8B, 0x80, 0xF0, 0x00, 0x00, 0x00, 					// [36] mov rax,[rax+F0]
+		0xF3, 0x0F, 0x10, 0x80, 0x98, 0x37, 0x00, 0x00, 			// [43] movss xmm0,[rax+3798]
+		0x58, 														// [51] pop rax
+
+		// orig:
+		0x0F, 0x29, 0x44, 0x24, 0x20, 								// [52] movaps [rsp+20], xmm0
+
+		//return to orig (64bit jmp)
+		0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [57] mov r10, addr_xxxxxxxx
+		0x41, 0xFF, 0xE2, 											// jmp r10 
+	};
+
+	// Update patch addresses:
+	uint64_t addr_bbjcode = (uint64_t) bbjcode_bytes;
+	memcpy(&jump_patch.patch[2], &addr_bbjcode, sizeof(addr_bbjcode)); 		// jmp fw
 	
-	addrToJumpTo64 = (uint64_t) jumphook;
-	memcpy(&jump_patch.patch[2], &addrToJumpTo64, sizeof(addrToJumpTo64)); 		// jmp fw
-	memcpy(&jump_bytes[59],&jumpinj_ret,sizeof(jumpinj_ret)); 					// return to jumpinject (+offset)
-	memcpy(&jump_bytes[14],&BasePtr,sizeof(BasePtr)); 							// fix mov rax,[BasePtr]
+	// Fill in addresses in bbjcode:
+	memcpy(&bbjcode_bytes[14],&baseA,sizeof(baseA)); 				// mov rax,[baseA]
+
+	// Fix inject return address
+	void* jumpinjaddr = module_addr + jump_patch.rel_addr;
+	void* jumpinj_ret = jumpinjaddr + jump_patch.size;
+	memcpy(&bbjcode_bytes[59],&jumpinj_ret,sizeof(jumpinj_ret)); 	// return to jumpinject (+offset)
 	
+
+	// Make bbjcode_bytes executable:
+	DWORD op;
+	VirtualProtect(bbjcode_bytes, sizeof(bbjcode_bytes),
+		PAGE_EXECUTE_READWRITE, &op);
+
 	// Edit memory:
-	size = jump_patch.size;
+	DWORD size = jump_patch.size;
 	if (memcmp(jumpinjaddr, jump_patch.orig, size) == 0) {
 		DWORD old;
 		VirtualProtect(jumpinjaddr, size, PAGE_EXECUTE_READWRITE, &old);
